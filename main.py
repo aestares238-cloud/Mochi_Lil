@@ -316,7 +316,6 @@ def get_year_month_day(timestamp):
 
 @app.get("/telemetry")
 def get_telemetry(start: Optional[str] = None, end: Optional[str] = None, ac_unit: Optional[str] = 'telemetry'):
-	# Validate and normalize incoming date strings to SQLite 'YYYY-MM-DD HH:MM:SS'
 	start_param = None
 	end_param = None
 	try:
@@ -395,7 +394,6 @@ def get_telemetry(start: Optional[str] = None, end: Optional[str] = None, ac_uni
 
 @app.get("/telemetry/column")
 def telemetry_column(column: Optional[str] = None, start: Optional[str] = None, end: Optional[str] = None, ac_unit: Optional[str] = 'telemetry'):
-	# Return timestamp and the requested column values, optional ISO date range filter
 	if not column:
  		raise HTTPException(status_code=400, detail="Missing 'column' query parameter")
 		
@@ -659,12 +657,10 @@ def set_ac_setup(payload: ACSetup):
 
 
 def _delayed_shutdown() -> None:
-	# Give the API response time to return before powering down.
 	time.sleep(1)
 	try:
 		subprocess.run(["sudo", "shutdown", "-h", "now"], check=False)
 	except Exception:
-		# Fallback command if sudo is not configured for this runtime.
 		os.system("shutdown -h now")
 
 
@@ -680,5 +676,3 @@ def get_isolation_forest_scatter(ac_unit: Optional[str] = None, limit: int = 500
 		return service.get_scatter_data(ac_unit=ac_unit, limit=limit)
 	except Exception as e:
 		return {"error": str(e), "points": [], "stats": {"total": 0, "regular": 0, "abnormal": 0, "contamination": 0.05}}
-
-
