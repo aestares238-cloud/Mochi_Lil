@@ -5,12 +5,12 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 import os
+import time
 
 LOCAL_TZ = timezone(timedelta(hours=8))
 from pathlib import Path
 import subprocess
 import threading
-import time
 from database import get_db_connection
 from ac_setup import get_ac_setup, update_ac_setup
 from web_routes import router as web_router, _read_template
@@ -41,12 +41,8 @@ class Item(BaseModel):
 	name: str
 	description: Optional[str] = None
 
-
 _fake_db: dict[int, dict] = {}
-
-
 DB_PATH = Path("telemetry.db")
-
 
 class Telemetry(BaseModel):
 	ac_unit: Optional[str] = None
@@ -65,23 +61,15 @@ class Telemetry(BaseModel):
 	ac_status: Optional[str] = None
 	ac_thermostat: Optional[str] = None
 
-
 class ACSetup(BaseModel):
 	ac_status: Optional[str] = None
 	ac_thermostat: Optional[str] = None
 	data_gathering_mode: Optional[str] = None
 	data_gathering_unit: Optional[str] = None
 
-
-@app.on_event("startup")
-def on_startup():
-	pass
-
-
 class LoginRequest(BaseModel):
 	username: str
 	password: str
-
 
 @app.post("/api/login")
 def api_login(payload: LoginRequest, response: Response):
@@ -98,18 +86,15 @@ def api_login(payload: LoginRequest, response: Response):
 	if not verify_password(payload.password, hashed):
 		raise HTTPException(status_code=401, detail="Invalid username or password")
 
-	# Create session
 	token, _ = generate_session(payload.username)
-
 	response.set_cookie(
 		key="admin_session",
 		value=token,
 		httponly=True,
-		max_age=86400,  # 1 day
+		max_age=86400,
 		samesite="lax",
 	)
 	return {"status": "success"}
-
 
 @app.post("/api/logout")
 @app.get("/api/logout")
@@ -120,7 +105,6 @@ def api_logout(request: Request, response: Response):
 	response.delete_cookie("admin_session")
 	return RedirectResponse(url="/pages/login", status_code=303)
 
-
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
 	token = request.cookies.get("admin_session")
@@ -129,18 +113,78 @@ def read_root(request: Request):
 	return HTMLResponse(_read_template("control_panel.html"))
 
 
-# Anomaly alert debouncer state
+# --- ALERT STATE ---
 has_detected_first_anomaly = False
 alert_timer = None
 timer_lock = threading.Lock()
 
+# Global cooldown trackers
+last_critical_alert_time = 0
+last_basic_alert_time = 0
+
+CRITICAL_COOLDOWN = 300   # 5 minutes
+BASIC_COOLDOWN = 900      # 15 minutes
+
+def is_critical_payload(rule_result):
+    """Checks if the triggered rules contain any of the critical variables."""
+    
+    # 1. Define the exact Critical Rules (Instant alert + 5 min cooldown)
+    critical_ids = {
+        "compressor_overheating", # Combined rule
+        "dht_offline", 
+        "pzem_offline", 
+        "temp1_offline", 
+        "temp2_offline", 
+        "vibration_offline"
+    }
+    
+    for finding in rule_result.get("findings", []):
+        sensor_key = finding.get("sensor_key", "")
+        issue_text = finding.get("issue", "")
+        
+        # 2. Check the exact IDs
+        if sensor_key in critical_ids:
+            return True
+            
+        # 3. Check specific High/Critical thresholds that share sensor names
+        if sensor_key == "pzem_current" and "High" in issue_text: return True
+        if sensor_key == "pzem_voltage" and "High" in issue_text: return True
+        if sensor_key == "pzem_power" and "High" in issue_text: return True
+        if sensor_key == "vibration" and "Excessive" in issue_text: return True
+        
+        # Temp 1: Only High is critical (Low Cold is basic)
+        if sensor_key == "ds18b20_temp1" and "High" in issue_text: return True
+        
+        # Temp 2: Only High is critical (Low Cold is basic)
+        if sensor_key == "ds18b20_temp2" and "High" in issue_text: return True
+        
+    return False
+
 def trigger_alert_action(data):
-	global alert_timer, has_detected_first_anomaly
+	global alert_timer, has_detected_first_anomaly, last_critical_alert_time, last_basic_alert_time
 	with timer_lock:
 		alert_timer = None
-	# Mark that an alert has been triggered
+	
+	from services.rule_engine import analyze_with_rules
+	rule_result = analyze_with_rules(data)
+	
+	is_critical = is_critical_payload(rule_result)
+	now = time.time()
+	
+	# Check Cooldowns
+	if is_critical:
+		if now - last_critical_alert_time < CRITICAL_COOLDOWN:
+			print(f"\n[COOLDOWN] Critical alert ignored. Waiting {CRITICAL_COOLDOWN/60:.0f} mins between critical alerts.", flush=True)
+			return
+		last_critical_alert_time = now
+	else:
+		if now - last_basic_alert_time < BASIC_COOLDOWN:
+			print(f"\n[COOLDOWN] Basic alert ignored. Waiting {BASIC_COOLDOWN/60:.0f} mins between basic alerts.", flush=True)
+			return
+		last_basic_alert_time = now
+
 	has_detected_first_anomaly = True
-	print(f"\n[DEBOUNCER] Delay completed. Processing anomaly alert...", flush=True)
+	print(f"\n[PROCESSING] Firing {'CRITICAL' if is_critical else 'BASIC'} alert and sending SMS...", flush=True)
 	try:
 		process_anomaly(data)
 	except Exception as e:
@@ -150,7 +194,6 @@ def trigger_alert_action(data):
 def process_telemetry_background(payload_dict: dict):
 	global alert_timer
 	try:
-		# Use AC setup values from the ac_setup table (single source of truth)
 		ac_values = get_ac_setup()
 		ac_status = ac_values.get("ac_status", "Not Set")
 		ac_thermostat = ac_values.get("ac_thermostat", "Not Set")
@@ -163,134 +206,76 @@ def process_telemetry_background(payload_dict: dict):
 			cur.execute(
 				"""
 				INSERT INTO data_gathered (
-					timestamp, ac_unit,
-					dust_sensor, dht_temp, dht_humidity, vibration,
-					ds18b20_temp1, ds18b20_temp2,
-					pzem_voltage, pzem_current, pzem_power, pzem_energy,
-					pzem_frequency, pzem_power_factor,
-					ac_status, ac_thermostat
-				) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-				RETURNING id
+					timestamp, ac_unit, dust_sensor, dht_temp, dht_humidity, vibration,
+					ds18b20_temp1, ds18b20_temp2, pzem_voltage, pzem_current, pzem_power, pzem_energy,
+					pzem_frequency, pzem_power_factor, ac_status, ac_thermostat
+				) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 				""",
-				(
-					datetime.now(LOCAL_TZ),
-					data_gathering_unit,
-					payload_dict.get("dust_sensor"),
-					payload_dict.get("dht_temp"),
-					payload_dict.get("dht_humidity"),
-					payload_dict.get("vibration"),
-					payload_dict.get("ds18b20_temp1"),
-					payload_dict.get("ds18b20_temp2"),
-					payload_dict.get("pzem_voltage"),
-					payload_dict.get("pzem_current"),
-					payload_dict.get("pzem_power"),
-					payload_dict.get("pzem_energy"),
-					payload_dict.get("pzem_frequency"),
-					payload_dict.get("pzem_power_factor"),
-					ac_status,
-					ac_thermostat,
-				),
+				(datetime.now(LOCAL_TZ), data_gathering_unit, payload_dict.get("dust_sensor"), payload_dict.get("dht_temp"), payload_dict.get("dht_humidity"), payload_dict.get("vibration"), payload_dict.get("ds18b20_temp1"), payload_dict.get("ds18b20_temp2"), payload_dict.get("pzem_voltage"), payload_dict.get("pzem_current"), payload_dict.get("pzem_power"), payload_dict.get("pzem_energy"), payload_dict.get("pzem_frequency"), payload_dict.get("pzem_power_factor"), ac_status, ac_thermostat),
 			)
 			row_id = cur.fetchone()['id']
-			print(f"\n[BACKGROUND] Telemetry stored in data_gathered table (unit {data_gathering_unit}) with ID {row_id}", flush=True)
+			print(f"\n[BACKGROUND] Stored in data_gathered with ID {row_id}", flush=True)
 		else:
 			cur.execute(
 				"""
 				INSERT INTO telemetry (
-					timestamp,
-					dust_sensor, dht_temp, dht_humidity, vibration,
-					ds18b20_temp1, ds18b20_temp2,
-					pzem_voltage, pzem_current, pzem_power, pzem_energy,
-					pzem_frequency, pzem_power_factor,
-					ac_status, ac_thermostat
-				) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-				RETURNING id
+					timestamp, dust_sensor, dht_temp, dht_humidity, vibration,
+					ds18b20_temp1, ds18b20_temp2, pzem_voltage, pzem_current, pzem_power, pzem_energy,
+					pzem_frequency, pzem_power_factor, ac_status, ac_thermostat
+				) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 				""",
-				(
-					datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-					payload_dict.get("dust_sensor"),
-					payload_dict.get("dht_temp"),
-					payload_dict.get("dht_humidity"),
-					payload_dict.get("vibration"),
-					payload_dict.get("ds18b20_temp1"),
-					payload_dict.get("ds18b20_temp2"),
-					payload_dict.get("pzem_voltage"),
-					payload_dict.get("pzem_current"),
-					payload_dict.get("pzem_power"),
-					payload_dict.get("pzem_energy"),
-					payload_dict.get("pzem_frequency"),
-					payload_dict.get("pzem_power_factor"),
-					ac_status,
-					ac_thermostat,
-				),
+				(datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"), payload_dict.get("dust_sensor"), payload_dict.get("dht_temp"), payload_dict.get("dht_humidity"), payload_dict.get("vibration"), payload_dict.get("ds18b20_temp1"), payload_dict.get("ds18b20_temp2"), payload_dict.get("pzem_voltage"), payload_dict.get("pzem_current"), payload_dict.get("pzem_power"), payload_dict.get("pzem_energy"), payload_dict.get("pzem_frequency"), payload_dict.get("pzem_power_factor"), ac_status, ac_thermostat),
 			)
 			row_id = cur.fetchone()['id']
-			print(f"\n[BACKGROUND] Telemetry successfully stored with ID {row_id}", flush=True)
+			print(f"\n[BACKGROUND] Stored in telemetry with ID {row_id}", flush=True)
 		conn.commit()
 		conn.close()
 	except Exception as db_err:
-		print(f"\n[ERROR] Failed to save telemetry in background: {db_err}", flush=True)
+		print(f"\n[ERROR] Failed to save telemetry: {db_err}", flush=True)
 		return
 
-	# Check for real-time dust anomaly (dust > 340.0 ug/m3)
-	try:
-		dust_val = payload_dict.get("dust_sensor")
-		has_dust_anomaly = dust_val is not None and float(dust_val) > 340.0
-	except (ValueError, TypeError):
-		has_dust_anomaly = False
-
-	if has_dust_anomaly:
-		print(f"\n[DEBOUNCER] Dust anomaly detected ({dust_val} µg/m³). Processing real-time alert immediately!", flush=True)
-		# Cancel any pending non-dust alert timer
-		with timer_lock:
-			if alert_timer is not None:
-				alert_timer.cancel()
-				alert_timer = None
-		# Mark that an alert has been triggered
-		has_detected_first_anomaly = True
-		try:
-			payload_dict["ac_status"] = ac_status
-			payload_dict["ac_thermostat"] = ac_thermostat
-			process_anomaly(payload_dict)
-		except Exception as e:
-			print(f"\n[ERROR] process_anomaly failed for dust: {e}\n", flush=True)
-		return
-
-	# Copy payload for ML model detection
-	model_data = dict(payload_dict)
-	model_data.pop("ac_status", None)
-	model_data.pop("ac_thermostat", None)
-
-	# Perform deterministic rule checks first
+	# --- SMART DEBOUNCER LOGIC ---
 	from services.rule_engine import analyze_with_rules
 	rule_result = analyze_with_rules(payload_dict)
 	has_rule_violation = len(rule_result["findings"]) > 0
 
+	has_critical_rule = is_critical_payload(rule_result)
+
+	model_data = dict(payload_dict)
+	model_data.pop("ac_status", None)
+	model_data.pop("ac_thermostat", None)
+
 	try:
 		is_anom = has_rule_violation or service.is_anomaly(model_data)
+		
 		if is_anom:
 			payload_dict["ac_status"] = ac_status
 			payload_dict["ac_thermostat"] = ac_thermostat
 			
-			# Handle debouncing with threading.Timer
-			with timer_lock:
-				if alert_timer is None:
-					# 8 minutes (480s) for the first non-dust alert, 2 minutes (120s) thereafter
-					delay = 480.0 if not has_detected_first_anomaly else 120.0
-					print(f"\n[DEBOUNCER] Anomaly detected! Starting {delay}s alert delay...", flush=True)
-					alert_timer = threading.Timer(delay, trigger_alert_action, [payload_dict])
-					alert_timer.start()
-				else:
-					print("\n[DEBOUNCER] Anomaly detected, but alert timer is already running. Keeping original schedule.", flush=True)
+			# Fire instantly for Critical issues
+			if has_critical_rule:
+				print(f"\n[SMART DEBOUNCER] INSTANT ALERT TRIGGERED (Critical).", flush=True)
+				with timer_lock:
+					if alert_timer is not None:
+						alert_timer.cancel()
+						alert_timer = None
+				trigger_alert_action(payload_dict)
+			else:
+				# Delay basic alerts by 8 minutes
+				with timer_lock:
+					if alert_timer is None:
+						delay = 480.0 if not has_detected_first_anomaly else 120.0
+						print(f"\n[SMART DEBOUNCER] Basic anomaly. Starting {delay}s delay...", flush=True)
+						alert_timer = threading.Timer(delay, trigger_alert_action, [payload_dict])
+						alert_timer.start()
 		else:
-			# If system is normal, cancel any pending alert timer
 			with timer_lock:
 				if alert_timer is not None:
-					print("\n[DEBOUNCER] Telemetry is normal. Canceling pending anomaly alert!", flush=True)
+					print("\n[SMART DEBOUNCER] Telemetry normal. Canceling pending alert.", flush=True)
 					alert_timer.cancel()
 					alert_timer = None
 	except Exception as ml_err:
-		print(f"\n[ERROR] Anomaly detection failed in background: {ml_err}", flush=True)
+		print(f"\n[ERROR] Anomaly detection failed: {ml_err}", flush=True)
 
 
 @app.post("/telemetry", status_code=201)
@@ -369,15 +354,9 @@ def get_telemetry(start: Optional[str] = None, end: Optional[str] = None, ac_uni
 		for y, m, d in ymd_pairs:
 			start_str = f"{y:04d}-{m:02d}-{d:02d} 00:00:00"
 			if ac_unit == 'telemetry' or not ac_unit:
-				cur.execute(
-					"SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1",
-					(start_str,)
-				)
+				cur.execute("SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1", (start_str,))
 			else:
-				cur.execute(
-					"SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1",
-					(start_str, ac_unit)
-				)
+				cur.execute("SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1", (start_str, ac_unit))
 			start_row = cur.fetchone()
 			starts[(y, m, d)] = start_row['pzem_energy'] if (start_row and start_row['pzem_energy'] is not None) else 0.0
 
@@ -397,13 +376,7 @@ def telemetry_column(column: Optional[str] = None, start: Optional[str] = None, 
 	if not column:
  		raise HTTPException(status_code=400, detail="Missing 'column' query parameter")
 		
-	allowed = {
-		"id", "timestamp", "dust_sensor", "dht_temp", "dht_humidity", "vibration",
-		"ds18b20_temp1", "ds18b20_temp2", "pzem_voltage", "pzem_current",
-		"pzem_power", "pzem_energy", "pzem_frequency", "pzem_power_factor",
-		"ac_status", "ac_thermostat",
-	}
-
+	allowed = {"id", "timestamp", "dust_sensor", "dht_temp", "dht_humidity", "vibration", "ds18b20_temp1", "ds18b20_temp2", "pzem_voltage", "pzem_current", "pzem_power", "pzem_energy", "pzem_frequency", "pzem_power_factor", "ac_status", "ac_thermostat"}
 	if column not in allowed:
 		raise HTTPException(status_code=400, detail="Invalid column requested")
 
@@ -461,15 +434,9 @@ def telemetry_column(column: Optional[str] = None, start: Optional[str] = None, 
 			for y, m, d in ymd_pairs:
 				start_str = f"{y:04d}-{m:02d}-{d:02d} 00:00:00"
 				if ac_unit == 'telemetry' or not ac_unit:
-					cur.execute(
-						"SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1",
-						(start_str,)
-					)
+					cur.execute("SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1", (start_str,))
 				else:
-					cur.execute(
-						"SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1",
-						(start_str, ac_unit)
-					)
+					cur.execute("SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1", (start_str, ac_unit))
 				start_row = cur.fetchone()
 				starts[(y, m, d)] = start_row['pzem_energy'] if (start_row and start_row['pzem_energy'] is not None) else 0.0
 			
@@ -505,15 +472,9 @@ def latest_telemetry(ac_unit: Optional[str] = 'telemetry'):
 	y, m, d = get_year_month_day(ts)
 	start_str = f"{y:04d}-{m:02d}-{d:02d} 00:00:00"
 	if ac_unit == 'telemetry' or not ac_unit:
-		cur.execute(
-			"SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1",
-			(start_str,)
-		)
+		cur.execute("SELECT pzem_energy FROM telemetry WHERE timestamp >= %s ORDER BY timestamp ASC LIMIT 1", (start_str,))
 	else:
-		cur.execute(
-			"SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1",
-			(start_str, ac_unit)
-		)
+		cur.execute("SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1", (start_str, ac_unit))
 	start_row = cur.fetchone()
 	conn.close()
 	
@@ -572,10 +533,7 @@ def get_data_gathered(ac_unit: Optional[str] = None):
 		starts = {}
 		for y, m, d, ac in ymd_ac_pairs:
 			start_str = f"{y:04d}-{m:02d}-{d:02d} 00:00:00"
-			cur.execute(
-				"SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1",
-				(start_str, ac)
-			)
+			cur.execute("SELECT pzem_energy FROM data_gathered WHERE timestamp >= %s AND ac_unit = %s ORDER BY timestamp ASC LIMIT 1", (start_str, ac))
 			start_row = cur.fetchone()
 			starts[(y, m, d, ac)] = start_row['pzem_energy'] if (start_row and start_row['pzem_energy'] is not None) else 0.0
 
@@ -600,33 +558,12 @@ def save_data_gathered(payload: Telemetry):
 	cur.execute(
 		"""
 		INSERT INTO data_gathered (
-			timestamp, ac_unit,
-			dust_sensor, dht_temp, dht_humidity, vibration,
-			ds18b20_temp1, ds18b20_temp2,
-			pzem_voltage, pzem_current, pzem_power, pzem_energy,
-			pzem_frequency, pzem_power_factor,
-			ac_status, ac_thermostat
-		) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-		RETURNING id
+			timestamp, ac_unit, dust_sensor, dht_temp, dht_humidity, vibration,
+			ds18b20_temp1, ds18b20_temp2, pzem_voltage, pzem_current, pzem_power, pzem_energy,
+			pzem_frequency, pzem_power_factor, ac_status, ac_thermostat
+		) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 		""",
-		(
-			datetime.now(LOCAL_TZ),
-			ac_unit,
-			payload_dict.get("dust_sensor"),
-			payload_dict.get("dht_temp"),
-			payload_dict.get("dht_humidity"),
-			payload_dict.get("vibration"),
-			payload_dict.get("ds18b20_temp1"),
-			payload_dict.get("ds18b20_temp2"),
-			payload_dict.get("pzem_voltage"),
-			payload_dict.get("pzem_current"),
-			payload_dict.get("pzem_power"),
-			payload_dict.get("pzem_energy"),
-			payload_dict.get("pzem_frequency"),
-			payload_dict.get("pzem_power_factor"),
-			payload_dict.get("ac_status"),
-			payload_dict.get("ac_thermostat"),
-		)
+		(datetime.now(LOCAL_TZ), ac_unit, payload_dict.get("dust_sensor"), payload_dict.get("dht_temp"), payload_dict.get("dht_humidity"), payload_dict.get("vibration"), payload_dict.get("ds18b20_temp1"), payload_dict.get("ds18b20_temp2"), payload_dict.get("pzem_voltage"), payload_dict.get("pzem_current"), payload_dict.get("pzem_power"), payload_dict.get("pzem_energy"), payload_dict.get("pzem_frequency"), payload_dict.get("pzem_power_factor"), payload_dict.get("ac_status"), payload_dict.get("ac_thermostat"))
 	)
 	row_id = cur.fetchone()['id']
 	conn.commit()
@@ -647,13 +584,7 @@ def set_ac_setup(payload: ACSetup):
 	data_gathering_mode = payload.data_gathering_mode if payload.data_gathering_mode is not None else ac_values.get("data_gathering_mode", "telemetry")
 	data_gathering_unit = payload.data_gathering_unit if payload.data_gathering_unit is not None else ac_values.get("data_gathering_unit", "AC2")
 	update_ac_setup(ac_status, ac_thermostat, data_gathering_mode, data_gathering_unit)
-	return {
-		"status": "updated",
-		"ac_status": ac_status,
-		"ac_thermostat": ac_thermostat,
-		"data_gathering_mode": data_gathering_mode,
-		"data_gathering_unit": data_gathering_unit
-	}
+	return {"status": "updated", "ac_status": ac_status, "ac_thermostat": ac_thermostat, "data_gathering_mode": data_gathering_mode, "data_gathering_unit": data_gathering_unit}
 
 
 def _delayed_shutdown() -> None:
