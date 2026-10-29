@@ -1,37 +1,29 @@
 import bcrypt
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from database import get_db_connection
 
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt."""
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 def verify_password(password: str, hashed_password: str) -> bool:
-    """Verify a raw password against its bcrypt hash."""
     try:
         return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
     except Exception:
         return False
 
 def generate_session(username: str) -> tuple[str, str]:
-    """
-    Generates a secure 32-byte token and a 24-hour expiry ISO timestamp.
-    Saves it to the admin_sessions table to allow multiple active sessions per user.
-    """
     token = secrets.token_hex(32)
-    # Store with explicit UTC timezone
-    expiry = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    expiry = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Optional cleanup: remove expired sessions for this user
     try:
         cur.execute(
             "DELETE FROM admin_sessions WHERE username = %s AND access_token_expiry < %s",
-            (username, datetime.now(timezone.utc).isoformat())
+            (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         )
     except Exception:
         pass
@@ -45,28 +37,19 @@ def generate_session(username: str) -> tuple[str, str]:
     return token, expiry
 
 def clear_session(token: str) -> None:
-    """Invalidates the session token in the database."""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM admin_sessions WHERE access_token = %s",
-        (token,)
-    )
+    cur.execute("DELETE FROM admin_sessions WHERE access_token = %s", (token,))
     conn.commit()
     conn.close()
 
 def get_admin_from_token(token: str) -> dict | None:
-    """
-    Checks if a token is valid and not expired.
-    Returns the admin record dict or None if invalid.
-    """
     if not token:
         return None
         
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Check if session exists
     cur.execute(
         "SELECT username, access_token_expiry FROM admin_sessions WHERE access_token = %s",
         (token,)
@@ -78,30 +61,26 @@ def get_admin_from_token(token: str) -> dict | None:
         return None
         
     try:
-        expiry_str = session_row["access_token_expiry"]
-        if not expiry_str:
-            conn.close()
-            return None
-        expiry = datetime.fromisoformat(expiry_str)
-        # Handle timezone compatibility
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-            
-        if datetime.now(timezone.utc) > expiry:
-            # Token is expired, clean it up
+        expiry_str = str(session_row["access_token_expiry"])
+        # Strip timezone markers just in case
+        if "+" in expiry_str: expiry_str = expiry_str.split("+")[0]
+        if "." in expiry_str: expiry_str = expiry_str.split(".")[0]
+        expiry_str = expiry_str.replace("T", " ").strip()
+        
+        expiry = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        
+        if now > expiry:
             cur.execute("DELETE FROM admin_sessions WHERE access_token = %s", (token,))
             conn.commit()
             conn.close()
             return None
-    except Exception:
+    except Exception as e:
+        print(f"Session time parse error: {e}")
         conn.close()
         return None
         
-    # Session is valid. Get admin details from admin table
-    cur.execute(
-        "SELECT id, username FROM admin WHERE username = %s",
-        (session_row["username"],)
-    )
+    cur.execute("SELECT id, username FROM admin WHERE username = %s", (session_row["username"],))
     admin_row = cur.fetchone()
     conn.close()
     
@@ -110,6 +89,5 @@ def get_admin_from_token(token: str) -> dict | None:
         
     return {
         "id": admin_row["id"],
-        "username": admin_row["username"],
-        "access_token_expiry": session_row["access_token_expiry"]
+        "username": admin_row["username"]
     }
