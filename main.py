@@ -118,57 +118,39 @@ has_detected_first_anomaly = False
 alert_timer = None
 timer_lock = threading.Lock()
 
-# Global cooldown trackers
 last_critical_alert_time = 0
 last_basic_alert_time = 0
 
 CRITICAL_COOLDOWN = 300   # 5 minutes
 BASIC_COOLDOWN = 900      # 15 minutes
 
-def is_critical_payload(rule_result):
-    """Checks if the triggered rules contain any of the critical variables."""
-    
-    # 1. Define the exact Critical Rules (Instant alert + 5 min cooldown)
-    critical_ids = {
-        "compressor_overheating", # Combined rule
-        "dht_offline", 
-        "pzem_offline", 
-        "temp1_offline", 
-        "temp2_offline", 
-        "vibration_offline"
-    }
-    
-    for finding in rule_result.get("findings", []):
-        sensor_key = finding.get("sensor_key", "")
-        issue_text = finding.get("issue", "")
+def check_critical_raw(payload_dict):
+    """Looks directly at the raw numbers to determine if it's critical. No text matching."""
+    try:
+        if payload_dict.get("pzem_current") and float(payload_dict.get("pzem_current")) > 8.8: return True
+        if payload_dict.get("pzem_voltage") and float(payload_dict.get("pzem_voltage")) > 241.0: return True
+        if payload_dict.get("pzem_power") and float(payload_dict.get("pzem_power")) > 1860.0: return True
+        if payload_dict.get("vibration") and float(payload_dict.get("vibration")) >= 90.0: return True
+        if payload_dict.get("ds18b20_temp1") and float(payload_dict.get("ds18b20_temp1")) > 61.0: return True
+        if payload_dict.get("ds18b20_temp2") and float(payload_dict.get("ds18b20_temp2")) > 17.0: return True
         
-        # 2. Check the exact IDs
-        if sensor_key in critical_ids:
-            return True
-            
-        # 3. Check specific High/Critical thresholds that share sensor names
-        if sensor_key == "pzem_current" and "High" in issue_text: return True
-        if sensor_key == "pzem_voltage" and "High" in issue_text: return True
-        if sensor_key == "pzem_power" and "High" in issue_text: return True
-        if sensor_key == "vibration" and "Excessive" in issue_text: return True
-        
-        # Temp 1: Only High is critical (Low Cold is basic)
-        if sensor_key == "ds18b20_temp1" and "High" in issue_text: return True
-        
-        # Temp 2: Only High is critical (Low Cold is basic)
-        if sensor_key == "ds18b20_temp2" and "High" in issue_text: return True
-        
+        # Check offline sensors
+        if payload_dict.get("dht_temp") is None: return True
+        if payload_dict.get("dht_humidity") is None: return True
+        if payload_dict.get("pzem_voltage") is None: return True
+        if payload_dict.get("pzem_current") is None: return True
+        if payload_dict.get("ds18b20_temp1") is None: return True
+        if payload_dict.get("ds18b20_temp2") is None: return True
+        if payload_dict.get("vibration") is None: return True
+    except (ValueError, TypeError):
+        pass
     return False
 
-def trigger_alert_action(data):
+def trigger_alert_action(data, is_critical):
 	global alert_timer, has_detected_first_anomaly, last_critical_alert_time, last_basic_alert_time
 	with timer_lock:
 		alert_timer = None
 	
-	from services.rule_engine import analyze_with_rules
-	rule_result = analyze_with_rules(data)
-	
-	is_critical = is_critical_payload(rule_result)
 	now = time.time()
 	
 	# Check Cooldowns
@@ -239,7 +221,8 @@ def process_telemetry_background(payload_dict: dict):
 	rule_result = analyze_with_rules(payload_dict)
 	has_rule_violation = len(rule_result["findings"]) > 0
 
-	has_critical_rule = is_critical_payload(rule_result)
+	# Direct raw check for critical values
+	has_critical_rule = check_critical_raw(payload_dict)
 
 	model_data = dict(payload_dict)
 	model_data.pop("ac_status", None)
@@ -259,14 +242,14 @@ def process_telemetry_background(payload_dict: dict):
 					if alert_timer is not None:
 						alert_timer.cancel()
 						alert_timer = None
-				trigger_alert_action(payload_dict)
+				trigger_alert_action(payload_dict, True)
 			else:
 				# Delay basic alerts by 8 minutes
 				with timer_lock:
 					if alert_timer is None:
 						delay = 480.0 if not has_detected_first_anomaly else 120.0
 						print(f"\n[SMART DEBOUNCER] Basic anomaly. Starting {delay}s delay...", flush=True)
-						alert_timer = threading.Timer(delay, trigger_alert_action, [payload_dict])
+						alert_timer = threading.Timer(delay, trigger_alert_action, [payload_dict, False])
 						alert_timer.start()
 		else:
 			with timer_lock:
